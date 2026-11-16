@@ -1,17 +1,20 @@
 """
 Mini SIEM Dashboard
 Single-file Streamlit application for security event monitoring, log correlation,
-and interactive incident response tagging.
+Geo-IP threat mapping, entity relationship graph visualization, and incident response tagging.
 """
 
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 import altair as alt
+import plotly.express as px
+import plotly.graph_objects as go
+import networkx as nx
 
 # ---------------------------------------------------------
 # Page Configuration & Styling
@@ -113,6 +116,7 @@ WEB_BRACKET_TIME_REGEX = re.compile(r"\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\
 WEB_APACHE_TIME_REGEX = re.compile(r"\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2}(?:\s+[+-]\d{4})?)\]")
 
 # Syslog patterns
+SYSLOG_HOST_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(?P<host>[a-zA-Z0-9_.-]+)\s+")
 SSHD_FAILED = re.compile(r"sshd\[\d+\]:\s+Failed password for (?:invalid user )?(?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)")
 SSHD_ACCEPTED = re.compile(r"sshd\[\d+\]:\s+Accepted (?:password|publickey) for (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)")
 SSHD_DISCONN = re.compile(r"sshd\[\d+\]:\s+(?:Received disconnect from|Connection closed by)\s+(?P<ip>\S+)")
@@ -127,7 +131,6 @@ WEB_COMBINED = re.compile(
 
 def parse_timestamp(raw_text: str) -> Optional[datetime]:
     """Parse various log timestamp formats into a datetime object."""
-    # 1. Bracket ISO time [2026-11-16 03:02:40]
     m = WEB_BRACKET_TIME_REGEX.search(raw_text)
     if m:
         try:
@@ -135,7 +138,6 @@ def parse_timestamp(raw_text: str) -> Optional[datetime]:
         except Exception:
             pass
 
-    # 2. Standard ISO time: 2026-11-16 03:02:14
     m = ISO_TIME_REGEX.search(raw_text)
     if m:
         try:
@@ -144,7 +146,6 @@ def parse_timestamp(raw_text: str) -> Optional[datetime]:
         except Exception:
             pass
 
-    # 3. Apache/Nginx combined: 16/Nov/2026:03:02:40 +0000
     m = WEB_APACHE_TIME_REGEX.search(raw_text)
     if m:
         t_str = m.group(1).split()[0]
@@ -153,7 +154,6 @@ def parse_timestamp(raw_text: str) -> Optional[datetime]:
         except Exception:
             pass
 
-    # 4. Standard Syslog format: Nov 16 03:02:14
     m = SYSLOG_TIME_REGEX.search(raw_text)
     if m:
         try:
@@ -166,7 +166,7 @@ def parse_timestamp(raw_text: str) -> Optional[datetime]:
 
 
 def parse_log_line(line: str, filename: str) -> Optional[Dict]:
-    """Extract structured fields from a single log line."""
+    """Extract structured fields including host, IP, user, and severity."""
     clean_line = line.strip()
     if not clean_line or clean_line.startswith("#"):
         return None
@@ -182,6 +182,14 @@ def parse_log_line(line: str, filename: str) -> Optional[Dict]:
     action = "Log Event"
     details = clean_line
 
+    # Host extraction
+    host = "srv-prod-01"
+    host_match = SYSLOG_HOST_REGEX.search(clean_line)
+    if host_match:
+        host = host_match.group("host")
+    elif "web" in filename.lower() or "nginx" in filename.lower() or "apache" in filename.lower():
+        host = "web-prod-01"
+
     # 1. Check Web Combined Log Format
     web_match = WEB_COMBINED.search(clean_line)
     if web_match:
@@ -195,7 +203,6 @@ def parse_log_line(line: str, filename: str) -> Optional[Dict]:
         action = f"HTTP {method}"
         details = f"{method} {path} -> {status}"
 
-        # Heuristic severity for web traffic
         suspicious_keywords = ["' or '", "union select", "../", "wp-config", ".env", "shell.php", "/etc/shadow", "sqlmap"]
         is_suspicious_path = any(kw in path.lower() for kw in suspicious_keywords)
 
@@ -218,6 +225,7 @@ def parse_log_line(line: str, filename: str) -> Optional[Dict]:
 
         return {
             "timestamp": timestamp,
+            "host": host,
             "source_file": filename,
             "ip_address": ip,
             "username": user,
@@ -232,6 +240,7 @@ def parse_log_line(line: str, filename: str) -> Optional[Dict]:
     if m:
         return {
             "timestamp": timestamp,
+            "host": host,
             "source_file": filename,
             "ip_address": m.group("ip"),
             "username": m.group("user"),
@@ -246,6 +255,7 @@ def parse_log_line(line: str, filename: str) -> Optional[Dict]:
     if m:
         return {
             "timestamp": timestamp,
+            "host": host,
             "source_file": filename,
             "ip_address": m.group("ip"),
             "username": m.group("user"),
@@ -260,6 +270,7 @@ def parse_log_line(line: str, filename: str) -> Optional[Dict]:
     if m:
         return {
             "timestamp": timestamp,
+            "host": host,
             "source_file": filename,
             "ip_address": m.group("ip"),
             "username": "-",
@@ -289,6 +300,7 @@ def parse_log_line(line: str, filename: str) -> Optional[Dict]:
 
         return {
             "timestamp": timestamp,
+            "host": host,
             "source_file": filename,
             "ip_address": "-",
             "username": caller,
@@ -303,6 +315,7 @@ def parse_log_line(line: str, filename: str) -> Optional[Dict]:
     if m:
         return {
             "timestamp": timestamp,
+            "host": host,
             "source_file": filename,
             "ip_address": m.group("ip"),
             "username": "-",
@@ -337,6 +350,7 @@ def parse_log_line(line: str, filename: str) -> Optional[Dict]:
 
     return {
         "timestamp": timestamp,
+        "host": host,
         "source_file": filename,
         "ip_address": ip,
         "username": user,
@@ -359,7 +373,7 @@ def parse_log_files(files_data: List[Tuple[str, str]]) -> pd.DataFrame:
 
     if not records:
         return pd.DataFrame(
-            columns=["event_id", "timestamp", "source_file", "ip_address", "username", "severity", "action", "details", "tag", "notes", "raw_log"]
+            columns=["event_id", "timestamp", "host", "source_file", "ip_address", "username", "severity", "action", "details", "tag", "notes", "raw_log"]
         )
 
     df = pd.DataFrame(records)
@@ -369,6 +383,334 @@ def parse_log_files(files_data: List[Tuple[str, str]]) -> pd.DataFrame:
     df["tag"] = "Untagged"
     df["notes"] = ""
     return df
+
+
+# ---------------------------------------------------------
+# Geo-IP Resolution Engine
+# ---------------------------------------------------------
+def lookup_geo_ip(ip: str) -> Optional[Dict[str, Any]]:
+    """
+    Resolve an IP to geographical coordinates and threat classification.
+    Includes built-in mappings for RFC-1918 private LANs, threat telemetry sample IPs,
+    and a deterministic regional hub assignment for any arbitrary public IP.
+    """
+    if not ip or ip == "-":
+        return None
+
+    # 1. Private RFC-1918 / Loopback
+    if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172.16.") or ip.startswith("127."):
+        if ip == "10.0.0.15":
+            return {
+                "ip": ip,
+                "city": "Internal Backup Datacenter",
+                "country": "Internal LAN",
+                "lat": 39.0438,
+                "lon": -77.4874,  # Ashburn, VA
+                "location_type": "Internal Agent (LAN)",
+                "is_internal": True,
+            }
+        return {
+            "ip": ip,
+            "city": "Corporate HQ (Internal LAN)",
+            "country": "Internal LAN",
+            "lat": 37.7749,
+            "lon": -122.4194,  # San Francisco, CA
+            "location_type": "Internal Host / User (LAN)",
+            "is_internal": True,
+        }
+
+    # 2. Known Threat Intelligence / Sample External IPs
+    KNOWN_EXTERNAL = {
+        "198.51.100.23": {
+            "city": "Frankfurt",
+            "country": "Germany",
+            "lat": 50.1109,
+            "lon": 8.6821,
+            "location_type": "External Threat Actor (Brute Force / Exfiltration)",
+            "is_internal": False,
+        },
+        "203.0.113.88": {
+            "city": "Tokyo",
+            "country": "Japan",
+            "lat": 35.6762,
+            "lon": 139.6503,
+            "location_type": "External Port Scanner (Reconnaissance)",
+            "is_internal": False,
+        },
+    }
+
+    if ip in KNOWN_EXTERNAL:
+        res = dict(KNOWN_EXTERNAL[ip])
+        res["ip"] = ip
+        return res
+
+    # 3. Deterministic fallback for any other arbitrary uploaded public IP
+    GLOBAL_HUBS = [
+        ("London", "United Kingdom", 51.5074, -0.1278),
+        ("Amsterdam", "Netherlands", 52.3676, 4.9041),
+        ("Singapore", "Singapore", 1.3521, 103.8198),
+        ("Sydney", "Australia", -33.8688, 151.2093),
+        ("São Paulo", "Brazil", -23.5505, -46.6333),
+        ("Toronto", "Canada", 43.6532, -79.3832),
+        ("Seoul", "South Korea", 37.5665, 126.9780),
+        ("Paris", "France", 48.8566, 2.3522),
+        ("Mumbai", "India", 19.0760, 72.8777),
+        ("Stockholm", "Sweden", 59.3293, 18.0686),
+    ]
+    ip_parts = [int(p) for p in ip.split(".") if p.isdigit()]
+    idx = sum(ip_parts) % len(GLOBAL_HUBS)
+    hub = GLOBAL_HUBS[idx]
+
+    return {
+        "ip": ip,
+        "city": hub[0],
+        "country": hub[1],
+        "lat": hub[2],
+        "lon": hub[3],
+        "location_type": "External Public IP",
+        "is_internal": False,
+    }
+
+
+def build_geo_ip_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate event telemetry by IP address with Geo-IP coordinates."""
+    unique_ips = [ip for ip in df["ip_address"].unique() if ip != "-"]
+    rows = []
+
+    for ip in unique_ips:
+        geo = lookup_geo_ip(ip)
+        if not geo:
+            continue
+
+        ip_events = df[df["ip_address"] == ip]
+        event_count = len(ip_events)
+        users = [u for u in ip_events["username"].unique() if u != "-"]
+        users_str = ", ".join(users) if users else "None"
+
+        # Calculate threat classification
+        severities = ip_events["severity"].tolist()
+        if "CRITICAL" in severities:
+            threat = "CRITICAL"
+        elif "HIGH" in severities:
+            threat = "HIGH"
+        elif "WARNING" in severities:
+            threat = "WARNING"
+        elif geo["is_internal"]:
+            threat = "INTERNAL"
+        else:
+            threat = "INFO"
+
+        rows.append({
+            "ip": ip,
+            "city": geo["city"],
+            "country": geo["country"],
+            "lat": geo["lat"],
+            "lon": geo["lon"],
+            "location_type": geo["location_type"],
+            "is_internal": geo["is_internal"],
+            "threat_level": threat,
+            "event_count": event_count,
+            "associated_users": users_str,
+            "sample_action": ip_events["action"].iloc[0],
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------
+# Entity Relationship Graph Builder
+# ---------------------------------------------------------
+def build_entity_graph(df: pd.DataFrame, focus_entity: Optional[str] = None) -> Tuple[go.Figure, Dict[str, Any]]:
+    """Build an interactive NetworkX + Plotly relationship graph linking IPs, Usernames, and Hosts."""
+    G = nx.Graph()
+
+    for _, row in df.iterrows():
+        ip = row["ip_address"]
+        user = row["username"]
+        host = row.get("host", "srv-prod-01")
+        sev = row["severity"]
+
+        # 1. Host Node
+        if host and host != "-":
+            if not G.has_node(host):
+                G.add_node(host, entity_type="Host", events=0, highest_sev="INFO")
+            G.nodes[host]["events"] += 1
+
+        # 2. IP Node
+        if ip and ip != "-":
+            if not G.has_node(ip):
+                G.add_node(ip, entity_type="IP", events=0, highest_sev="INFO")
+            G.nodes[ip]["events"] += 1
+            if sev in ["CRITICAL", "HIGH"]:
+                G.nodes[ip]["highest_sev"] = sev
+
+            # Edge IP <-> Host
+            if host and host != "-":
+                if G.has_edge(ip, host):
+                    G[ip][host]["weight"] += 1
+                else:
+                    G.add_edge(ip, host, weight=1, relation="Traffic / Attack")
+
+        # 3. User Node
+        if user and user != "-":
+            if not G.has_node(user):
+                G.add_node(user, entity_type="User", events=0, highest_sev="INFO")
+            G.nodes[user]["events"] += 1
+            if sev in ["CRITICAL", "HIGH"]:
+                G.nodes[user]["highest_sev"] = sev
+
+            # Edge User <-> Host
+            if host and host != "-":
+                if G.has_edge(user, host):
+                    G[user][host]["weight"] += 1
+                else:
+                    G.add_edge(user, host, weight=1, relation="Session / Exec")
+
+            # Edge IP <-> User
+            if ip and ip != "-":
+                if G.has_edge(ip, user):
+                    G[ip][user]["weight"] += 1
+                else:
+                    G.add_edge(ip, user, weight=1, relation="Auth / Identity")
+
+    # If an entity is focused, extract ego network (1-hop neighbors)
+    if focus_entity and focus_entity != "All Entities" and focus_entity in G:
+        neighbors = list(G.neighbors(focus_entity)) + [focus_entity]
+        G = G.subgraph(neighbors).copy()
+
+    stats = {
+        "total_nodes": len(G.nodes),
+        "total_edges": len(G.edges),
+        "hosts": len([n for n, d in G.nodes(data=True) if d.get("entity_type") == "Host"]),
+        "ips": len([n for n, d in G.nodes(data=True) if d.get("entity_type") == "IP"]),
+        "users": len([n for n, d in G.nodes(data=True) if d.get("entity_type") == "User"]),
+    }
+
+    if len(G.nodes) == 0:
+        fig = go.Figure()
+        fig.update_layout(title="No entity nodes available.")
+        return fig, stats
+
+    # Compute spring layout
+    pos = nx.spring_layout(G, k=1.1, seed=42, iterations=100)
+
+    # Build Edges trace
+    edge_x = []
+    edge_y = []
+    edge_weights = []
+
+    for u, v, data in G.edges(data=True):
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+        edge_weights.append(data.get("weight", 1))
+
+    edge_trace = go.Scatter(
+        x=edge_x,
+        y=edge_y,
+        line=dict(width=1.8, color="#64748b"),
+        hoverinfo="none",
+        mode="lines",
+        showlegend=False,
+    )
+
+    # Build Node traces by category
+    node_configs = [
+        ("Host", "🖥️ Hosts", "#10b981", "square", 30),
+        ("IP", "🌐 IP Addresses", "#ef4444", "circle", 24),
+        ("User", "👤 User Accounts", "#a855f7", "triangle-up", 22),
+    ]
+
+    traces = [edge_trace]
+
+    for n_type, display_name, base_color, symbol, size in node_configs:
+        sub_nodes = [n for n, d in G.nodes(data=True) if d.get("entity_type") == n_type]
+        if not sub_nodes:
+            continue
+
+        x_pts = []
+        y_pts = []
+        hover_texts = []
+        labels = []
+        colors = []
+
+        for node_id in sub_nodes:
+            x, y = pos[node_id]
+            x_pts.append(x)
+            y_pts.append(y)
+            labels.append(node_id)
+
+            data = G.nodes[node_id]
+            degree = G.degree(node_id)
+            ev_count = data.get("events", 0)
+            h_sev = data.get("highest_sev", "INFO")
+
+            # Dynamic node coloring
+            if n_type == "IP":
+                if node_id.startswith("192.168.") or node_id.startswith("10.") or node_id.startswith("172."):
+                    node_col = "#3b82f6"  # Internal LAN (Blue)
+                else:
+                    node_col = "#ef4444"  # External Attacker (Red)
+            elif n_type == "User":
+                if h_sev in ["CRITICAL", "HIGH"]:
+                    node_col = "#f97316"  # Compromised / Targeted (Orange)
+                else:
+                    node_col = "#a855f7"  # Benign User (Purple)
+            else:
+                node_col = base_color
+
+            colors.append(node_col)
+
+            htext = (
+                f"<b>{n_type}: {node_id}</b><br>"
+                f"Direct Links: {degree}<br>"
+                f"Total Events: {ev_count}<br>"
+                f"Highest Severity: {h_sev}"
+            )
+            hover_texts.append(htext)
+
+        trace = go.Scatter(
+            x=x_pts,
+            y=y_pts,
+            mode="markers+text",
+            name=display_name,
+            marker=dict(
+                symbol=symbol,
+                size=size,
+                color=colors,
+                line=dict(width=2, color="#ffffff"),
+            ),
+            text=labels,
+            textposition="top center",
+            textfont=dict(color="#f8fafc", size=11),
+            hoverinfo="text",
+            hovertext=hover_texts,
+        )
+        traces.append(trace)
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title="🕸️ Entity Relationship Network (IPs ⟷ Users ⟷ Hosts)",
+        title_font=dict(size=18, color="#f8fafc"),
+        paper_bgcolor="#0b1329",
+        plot_bgcolor="#0b1329",
+        hovermode="closest",
+        margin=dict(b=20, l=20, r=20, t=50),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            font=dict(color="#f8fafc"),
+        ),
+        height=580,
+    )
+
+    return fig, stats
 
 
 # ---------------------------------------------------------
@@ -396,7 +738,7 @@ def main():
     # ---------------------------------------------------------
     with st.sidebar:
         st.title("🛡️ SIEM Ingestion")
-        st.caption("Upload multiple logs or test right away with sample data.")
+        st.caption("Upload multiple logs or test with pre-built multi-source attack telemetry.")
 
         uploaded_files = st.file_uploader(
             "Upload .log or .txt files",
@@ -473,18 +815,19 @@ def main():
         st.markdown("---")
         st.markdown(
             """
-            **How correlation works:**
-            1. Select an **IP** or **Username** (via button, table row, or filter).
-            2. The timeline highlights linked events within the chosen **time window**.
-            3. Review the unified attack chain across Web, SSH, and Firewall logs!
+            **SIEM Features Active:**
+            * 📈 **Timeline**: Chronological multi-log histogram.
+            * 🌍 **Geo-IP Map**: `scatter_geo` attack origins.
+            * 🕸️ **Entity Graph**: Visual IPs ⟷ Users ⟷ Hosts graph.
+            * 📋 **Triage Table**: In-table tagging and notes.
             """
         )
 
     # ---------------------------------------------------------
-    # Main Dashboard Header & Empty State
+    # Main Header & Empty State
     # ---------------------------------------------------------
     st.title("🛡️ Mini SIEM & Security Event Correlator")
-    st.caption("Unify multiple log sources into a single timeline, pivot on suspicious entities, and tag events for triage.")
+    st.caption("Unified multi-log timeline, Geo-IP threat mapping, relational graph intelligence, and incident triage.")
 
     df = st.session_state.events_df
 
@@ -492,7 +835,6 @@ def main():
         st.info("👋 **Welcome to your Mini SIEM Dashboard!** Upload log files from the sidebar, or click below to load sample attack data.")
         col_c1, _ = st.columns([1, 2])
         if col_c1.button("⚡ Click to Load Sample Attack Logs Now", type="primary", use_container_width=True):
-            # Trigger load
             sample_filenames = ["sample_auth.log", "sample_web.log"]
             loaded = []
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -509,140 +851,139 @@ def main():
         st.markdown(
             """
             ---
-            ### 🔍 What is in the included sample data?
-            * **`sample_auth.log`**: External brute force on SSH (`198.51.100.23`), unauthorized sudo shadow file read (`david`), and firewall drops (`203.0.113.88`).
-            * **`sample_web.log`**: Nginx/Apache access logs showing SQL injection probing, web login brute force, and sensitive database dump exfiltration.
-            * **The Story**: When you correlate by IP `198.51.100.23`, you will see web probing followed directly by SSH brute force, privilege escalation, and database theft!
+            ### 🔍 Included Threat Telemetry Scenario:
+            * **`sample_auth.log`**: External SSH brute force (`198.51.100.23`), unauthorized sudo shadow file read (`david`), and firewall drops (`203.0.113.88`).
+            * **`sample_web.log`**: SQL injection probe (`sqlmap`), admin login brute force, and sensitive database dump exfiltration.
+            * **Correlated Story**: Switch between the **Timeline**, **Geo-IP Attack Map**, and **Entity Relationship Graph** to see how the attacker moves across systems!
             """
         )
         return
 
     # ---------------------------------------------------------
-    # KPI Metrics Banner
+    # Global KPI Metrics Banner
     # ---------------------------------------------------------
     total_events = len(df)
     distinct_ips = len([ip for ip in df["ip_address"].unique() if ip != "-"])
     distinct_users = len([u for u in df["username"].unique() if u != "-"])
+    distinct_hosts = len([h for h in df["host"].unique() if h != "-"])
     critical_count = len(df[df["severity"].isin(["CRITICAL", "HIGH"])])
-    timespan_str = (
-        f"{df['timestamp'].min().strftime('%H:%M:%S')} - {df['timestamp'].max().strftime('%H:%M:%S')}"
-    )
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.markdown(f"<div class='kpi-card'><div class='kpi-title'>Total Events</div><div class='kpi-value'>{total_events:,}</div></div>", unsafe_allow_html=True)
     k2.markdown(f"<div class='kpi-card'><div class='kpi-title'>Distinct IPs</div><div class='kpi-value'>{distinct_ips}</div></div>", unsafe_allow_html=True)
-    k3.markdown(f"<div class='kpi-card'><div class='kpi-title'>Distinct Users</div><div class='kpi-value'>{distinct_users}</div></div>", unsafe_allow_html=True)
-    k4.markdown(f"<div class='kpi-card'><div class='kpi-title'>High / Critical</div><div class='kpi-value'>{critical_count}</div></div>", unsafe_allow_html=True)
-    k5.markdown(f"<div class='kpi-card'><div class='kpi-title'>Time Span</div><div class='kpi-value' style='font-size:1.15rem; margin-top:10px;'>{timespan_str}</div></div>", unsafe_allow_html=True)
+    k3.markdown(f"<div class='kpi-card'><div class='kpi-title'>Active Users</div><div class='kpi-value'>{distinct_users}</div></div>", unsafe_allow_html=True)
+    k4.markdown(f"<div class='kpi-card'><div class='kpi-title'>Target Hosts</div><div class='kpi-value'>{distinct_hosts}</div></div>", unsafe_allow_html=True)
+    k5.markdown(f"<div class='kpi-card'><div class='kpi-title'>High / Critical</div><div class='kpi-value' style='color:#dc2626;'>{critical_count}</div></div>", unsafe_allow_html=True)
 
     st.write("")
 
     # ---------------------------------------------------------
-    # SIEM Heuristics & Threat Detection Engine
+    # Tab Navigation
     # ---------------------------------------------------------
-    st.subheader("🚨 Automated Threat Detections")
-    t_col1, t_col2 = st.columns(2)
+    tab_timeline, tab_geomap, tab_graph, tab_table = st.tabs([
+        "📈 Overview & Timeline",
+        "🌍 Geo-IP Attack Map",
+        "🕸️ Entity Relationship Graph",
+        "📋 Triage Table & Export",
+    ])
 
-    with t_col1:
-        # Detect SSH Brute force (>2 failed logins)
-        failed_logins = df[df["action"] == "SSH Login Failed"]
-        ip_fail_counts = failed_logins["ip_address"].value_counts()
-        brute_ips = ip_fail_counts[ip_fail_counts >= 3].to_dict()
+    # =========================================================
+    # TAB 1: Overview, Automated Detections & Timeline
+    # =========================================================
+    with tab_timeline:
+        st.subheader("🚨 Automated Threat Detection Rules")
+        t_col1, t_col2 = st.columns(2)
 
-        if brute_ips:
-            for b_ip, count in brute_ips.items():
-                st.markdown(
-                    f"""
-                    <div class='threat-card'>
-                        <b>🚨 SSH Brute Force Detected</b><br/>
-                        IP <code>{b_ip}</code> generated <b>{count} failed login attempts</b> in rapid succession.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                if st.button(f"🔍 Pivot & Correlate Attacker `{b_ip}`", key=f"btn_brute_{b_ip}"):
-                    st.session_state.selected_ip = b_ip
-                    st.session_state.selected_user = "All Users"
-                    st.session_state.focal_timestamp = failed_logins[failed_logins["ip_address"] == b_ip]["timestamp"].min()
-                    st.rerun()
-        else:
-            st.success("✅ No SSH Brute Force patterns detected.")
+        with t_col1:
+            failed_logins = df[df["action"] == "SSH Login Failed"]
+            ip_fail_counts = failed_logins["ip_address"].value_counts()
+            brute_ips = ip_fail_counts[ip_fail_counts >= 3].to_dict()
 
-    with t_col2:
-        crit_events = df[df["severity"] == "CRITICAL"]
-        if not crit_events.empty:
-            for _, crit_row in crit_events.iterrows():
-                st.markdown(
-                    f"""
-                    <div class='threat-card'>
-                        <b>⚠️ {crit_row['action']}</b> ({crit_row['source_file']})<br/>
-                        <code>{crit_row['details']}</code>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                c_ip = crit_row["ip_address"] if crit_row["ip_address"] != "-" else None
-                c_user = crit_row["username"] if crit_row["username"] != "-" else None
-                label = f"🎯 Investigate {c_ip or c_user or crit_row['event_id']}"
-                if st.button(label, key=f"btn_crit_{crit_row['event_id']}"):
-                    if c_ip:
-                        st.session_state.selected_ip = c_ip
-                    if c_user:
-                        st.session_state.selected_user = c_user
-                    st.session_state.focal_timestamp = crit_row["timestamp"]
-                    st.rerun()
-        else:
-            st.success("✅ No critical web exploits or unauthorized root executions found.")
+            if brute_ips:
+                for b_ip, count in brute_ips.items():
+                    st.markdown(
+                        f"""
+                        <div class='threat-card'>
+                            <b>🚨 SSH Brute Force Detected</b><br/>
+                            IP <code>{b_ip}</code> generated <b>{count} failed login attempts</b> in rapid succession.
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(f"🔍 Pivot & Correlate Attacker `{b_ip}`", key=f"btn_brute_{b_ip}"):
+                        st.session_state.selected_ip = b_ip
+                        st.session_state.selected_user = "All Users"
+                        st.session_state.focal_timestamp = failed_logins[failed_logins["ip_address"] == b_ip]["timestamp"].min()
+                        st.rerun()
+            else:
+                st.success("✅ No SSH Brute Force patterns detected.")
 
-    st.divider()
+        with t_col2:
+            crit_events = df[df["severity"] == "CRITICAL"]
+            if not crit_events.empty:
+                for _, crit_row in crit_events.iterrows():
+                    st.markdown(
+                        f"""
+                        <div class='threat-card'>
+                            <b>⚠️ {crit_row['action']}</b> ({crit_row['source_file']})<br/>
+                            <code>{crit_row['details']}</code>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    c_ip = crit_row["ip_address"] if crit_row["ip_address"] != "-" else None
+                    c_user = crit_row["username"] if crit_row["username"] != "-" else None
+                    label = f"🎯 Investigate {c_ip or c_user or crit_row['event_id']}"
+                    if st.button(label, key=f"btn_crit_{crit_row['event_id']}"):
+                        if c_ip:
+                            st.session_state.selected_ip = c_ip
+                        if c_user:
+                            st.session_state.selected_user = c_user
+                        st.session_state.focal_timestamp = crit_row["timestamp"]
+                        st.rerun()
+            else:
+                st.success("✅ No critical web exploits or unauthorized root executions found.")
 
-    # ---------------------------------------------------------
-    # Unified Multi-Log Timeline Chart
-    # ---------------------------------------------------------
-    st.subheader("📈 Unified Timeline Histogram")
+        st.divider()
 
-    timeline_df = df.copy()
-    timeline_df["minute"] = timeline_df["timestamp"].dt.floor("1min")
-    grouped_timeline = (
-        timeline_df.groupby(["minute", "severity", "source_file"]).size().reset_index(name="event_count")
-    )
-
-    color_scale = alt.Scale(
-        domain=["INFO", "WARNING", "HIGH", "CRITICAL"],
-        range=["#38bdf8", "#facc15", "#fb923c", "#ef4444"],
-    )
-
-    chart = (
-        alt.Chart(grouped_timeline)
-        .mark_bar(size=14)
-        .encode(
-            x=alt.X("minute:T", title="Timeline (1-Minute Intervals)", axis=alt.Axis(format="%H:%M:%S")),
-            y=alt.Y("event_count:Q", title="Events"),
-            color=alt.Color("severity:N", scale=color_scale, title="Severity"),
-            tooltip=["minute:T", "source_file:N", "severity:N", "event_count:Q"],
+        # Altair Unified Timeline
+        st.subheader("📊 Unified Multi-Log Timeline Histogram")
+        timeline_df = df.copy()
+        timeline_df["minute"] = timeline_df["timestamp"].dt.floor("1min")
+        grouped_timeline = (
+            timeline_df.groupby(["minute", "severity", "source_file"]).size().reset_index(name="event_count")
         )
-        .properties(height=230)
-        .interactive()
-    )
-    st.altair_chart(chart, use_container_width=True)
 
-    # ---------------------------------------------------------
-    # Entity Click-to-Pivot & Filter Controls
-    # ---------------------------------------------------------
-    st.subheader("🔗 Click Any Entity to Highlight Linked Events")
-    st.caption("Click any IP or username chip below to correlate all events occurring around that activity across every log source.")
+        color_scale = alt.Scale(
+            domain=["INFO", "WARNING", "HIGH", "CRITICAL"],
+            range=["#38bdf8", "#facc15", "#fb923c", "#ef4444"],
+        )
 
-    unique_ips = [ip for ip in df["ip_address"].unique() if ip != "-"]
-    unique_users = [u for u in df["username"].unique() if u != "-"]
+        chart = (
+            alt.Chart(grouped_timeline)
+            .mark_bar(size=14)
+            .encode(
+                x=alt.X("minute:T", title="Timeline (1-Minute Intervals)", axis=alt.Axis(format="%H:%M:%S")),
+                y=alt.Y("event_count:Q", title="Events"),
+                color=alt.Color("severity:N", scale=color_scale, title="Severity"),
+                tooltip=["minute:T", "source_file:N", "severity:N", "event_count:Q"],
+            )
+            .properties(height=230)
+            .interactive()
+        )
+        st.altair_chart(chart, use_container_width=True)
 
-    # Quick Pivot Buttons (IPs and Users)
-    chip_row = st.container()
-    with chip_row:
+        # Entity Click-to-Pivot Quick Chips
+        st.subheader("🔗 Quick Pivot by Entity")
+        st.caption("Click any IP or username below to isolate and correlate all events occurring within the proximity time window:")
+
+        unique_ips = [ip for ip in df["ip_address"].unique() if ip != "-"]
+        unique_users = [u for u in df["username"].unique() if u != "-"]
+
         chip_cols = st.columns(max(len(unique_ips) + len(unique_users) + 1, 6))
         c_idx = 0
 
-        # "View All" chip
-        if chip_cols[c_idx].button("🔄 View All", key="chip_all", use_container_width=True):
+        if chip_cols[c_idx].button("🔄 View All", key="chip_all_t1", use_container_width=True):
             st.session_state.selected_ip = "All IPs"
             st.session_state.selected_user = "All Users"
             st.session_state.focal_timestamp = None
@@ -653,7 +994,7 @@ def main():
             if c_idx < len(chip_cols):
                 is_active = (st.session_state.selected_ip == ip_val)
                 label = f"🌐 {ip_val}" + (" (Active)" if is_active else "")
-                if chip_cols[c_idx].button(label, key=f"chip_ip_{ip_val}", use_container_width=True):
+                if chip_cols[c_idx].button(label, key=f"chip_ip_t1_{ip_val}", use_container_width=True):
                     st.session_state.selected_ip = ip_val
                     st.session_state.selected_user = "All Users"
                     st.session_state.focal_timestamp = df[df["ip_address"] == ip_val]["timestamp"].iloc[0]
@@ -664,227 +1005,357 @@ def main():
             if c_idx < len(chip_cols):
                 is_active = (st.session_state.selected_user == u_val)
                 label = f"👤 {u_val}" + (" (Active)" if is_active else "")
-                if chip_cols[c_idx].button(label, key=f"chip_user_{u_val}", use_container_width=True):
+                if chip_cols[c_idx].button(label, key=f"chip_user_t1_{u_val}", use_container_width=True):
                     st.session_state.selected_user = u_val
                     st.session_state.selected_ip = "All IPs"
-                    st.session_state.selected_user_timestamp = df[df["username"] == u_val]["timestamp"].iloc[0]
                     st.session_state.focal_timestamp = df[df["username"] == u_val]["timestamp"].iloc[0]
                     st.rerun()
                 c_idx += 1
 
-    # Filter selector bar
-    f_col1, f_col2, f_col3 = st.columns([2, 2, 2])
+        # Correlated Incident Progression Chain
+        is_entity_focused = (st.session_state.selected_ip != "All IPs") or (st.session_state.selected_user != "All Users")
+        if is_entity_focused:
+            entity_matches = pd.Series([False] * len(df), index=df.index)
+            if st.session_state.selected_ip != "All IPs":
+                entity_matches = entity_matches | (df["ip_address"] == st.session_state.selected_ip)
+            if st.session_state.selected_user != "All Users":
+                entity_matches = entity_matches | (df["username"] == st.session_state.selected_user)
 
-    avail_ips = ["All IPs"] + sorted(unique_ips)
-    cur_ip_idx = avail_ips.index(st.session_state.selected_ip) if st.session_state.selected_ip in avail_ips else 0
-    sel_ip = f_col1.selectbox("Filter IP Address", avail_ips, index=cur_ip_idx)
+            target_events = df[entity_matches]
+            if not target_events.empty:
+                if st.session_state.focal_timestamp is not None:
+                    pivot_time = pd.to_datetime(st.session_state.focal_timestamp)
+                else:
+                    pivot_time = target_events["timestamp"].iloc[0]
 
-    avail_users = ["All Users"] + sorted(unique_users)
-    cur_user_idx = avail_users.index(st.session_state.selected_user) if st.session_state.selected_user in avail_users else 0
-    sel_user = f_col2.selectbox("Filter Username", avail_users, index=cur_user_idx)
+                window_delta = timedelta(minutes=st.session_state.time_window_mins)
+                t_start = pivot_time - window_delta
+                t_end = pivot_time + window_delta
 
-    chosen_severities = f_col3.multiselect(
-        "Filter Severity",
-        ["INFO", "WARNING", "HIGH", "CRITICAL"],
-        default=["INFO", "WARNING", "HIGH", "CRITICAL"],
-    )
+                linked_mask = entity_matches & (df["timestamp"] >= t_start) & (df["timestamp"] <= t_end)
+                correlated_events = df[linked_mask].sort_values(by="timestamp")
 
-    st.session_state.selected_ip = sel_ip
-    st.session_state.selected_user = sel_user
+                entity_desc = []
+                if st.session_state.selected_ip != "All IPs":
+                    entity_desc.append(f"IP: <b>{st.session_state.selected_ip}</b>")
+                if st.session_state.selected_user != "All Users":
+                    entity_desc.append(f"User: <b>{st.session_state.selected_user}</b>")
 
-    # Correlation calculation
-    is_entity_focused = (sel_ip != "All IPs") or (sel_user != "All Users")
-    correlated_indices = set()
+                st.markdown(
+                    f"""
+                    <div class="linked-banner">
+                        <h4 style="margin: 0 0 6px 0;">🎯 Correlated Incident Chain for {' & '.join(entity_desc)}</h4>
+                        <span>Time Window: <b>{t_start.strftime('%H:%M:%S')}</b> to <b>{t_end.strftime('%H:%M:%S')}</b> (±{st.session_state.time_window_mins} mins). 
+                        Found <b>{len(correlated_events)} linked event(s)</b> across <b>{correlated_events['source_file'].nunique()} log source(s)</b>.</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-    if is_entity_focused:
-        # Build mask for target entity
-        entity_matches = pd.Series([False] * len(df), index=df.index)
-        if sel_ip != "All IPs":
-            entity_matches = entity_matches | (df["ip_address"] == sel_ip)
-        if sel_user != "All Users":
-            entity_matches = entity_matches | (df["username"] == sel_user)
+                with st.expander("🔍 Step-by-Step Chronological Attack Narrative", expanded=True):
+                    for _, cev in correlated_events.iterrows():
+                        b_cls = f"badge-{cev['severity'].lower()}"
+                        t_str = cev["timestamp"].strftime("%H:%M:%S")
+                        st.markdown(
+                            f"**`{t_str}`** &nbsp;|&nbsp; `{cev['source_file']}` &nbsp;|&nbsp; "
+                            f"<span class='{b_cls}'>{cev['severity']}</span> &nbsp;|&nbsp; "
+                            f"**{cev['action']}** &nbsp;|&nbsp; `{cev['details']}`",
+                            unsafe_allow_html=True,
+                        )
 
-        target_events = df[entity_matches]
+    # =========================================================
+    # TAB 2: Geo-IP Attack Map (plotly.express.scatter_geo)
+    # =========================================================
+    with tab_geomap:
+        st.subheader("🌍 Geo-IP Attack Origin Map")
+        st.caption("Interactive global attack origin visualization built with Plotly `scatter_geo`.")
 
-        if not target_events.empty:
-            if st.session_state.focal_timestamp is not None:
-                pivot_time = pd.to_datetime(st.session_state.focal_timestamp)
-            else:
-                pivot_time = target_events["timestamp"].iloc[0]
+        geo_df = build_geo_ip_dataframe(df)
 
-            window_delta = timedelta(minutes=st.session_state.time_window_mins)
-            t_start = pivot_time - window_delta
-            t_end = pivot_time + window_delta
-
-            # Events matching entity OR occurring in proximity
-            linked_mask = entity_matches & (df["timestamp"] >= t_start) & (df["timestamp"] <= t_end)
-            correlated_indices = set(df[linked_mask].index)
-            correlated_events = df.loc[list(correlated_indices)].sort_values(by="timestamp")
-
-            # Correlated Banner
-            entity_desc = []
-            if sel_ip != "All IPs":
-                entity_desc.append(f"IP: <b>{sel_ip}</b>")
-            if sel_user != "All Users":
-                entity_desc.append(f"User: <b>{sel_user}</b>")
-
-            st.markdown(
-                f"""
-                <div class="linked-banner">
-                    <h4 style="margin: 0 0 6px 0;">🎯 Correlated Incident Chain for {' & '.join(entity_desc)}</h4>
-                    <span>Time Window: <b>{t_start.strftime('%H:%M:%S')}</b> to <b>{t_end.strftime('%H:%M:%S')}</b> (±{st.session_state.time_window_mins} mins). 
-                    Found <b>{len(correlated_events)} linked event(s)</b> across <b>{correlated_events['source_file'].nunique()} log source(s)</b>.</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
+        if geo_df.empty:
+            st.info("No IP addresses found in the current log telemetry.")
+        else:
+            # Map Controls
+            map_c1, map_c2 = st.columns([3, 1])
+            projection_choice = map_c2.selectbox(
+                "Map Projection",
+                ["natural earth", "equirectangular", "orthographic", "mercator"],
+                index=0,
             )
 
-            # Attack Sequence Flow
-            with st.expander("🔍 Chronological Attack Progression Flow", expanded=True):
-                for _, cev in correlated_events.iterrows():
-                    b_cls = f"badge-{cev['severity'].lower()}"
-                    t_str = cev["timestamp"].strftime("%H:%M:%S")
-                    st.markdown(
-                        f"**`{t_str}`** &nbsp;|&nbsp; `{cev['source_file']}` &nbsp;|&nbsp; "
-                        f"<span class='{b_cls}'>{cev['severity']}</span> &nbsp;|&nbsp; "
-                        f"**{cev['action']}** &nbsp;|&nbsp; `{cev['details']}`",
-                        unsafe_allow_html=True,
-                    )
+            # Render scatter_geo
+            fig_map = px.scatter_geo(
+                geo_df,
+                lat="lat",
+                lon="lon",
+                hover_name="ip",
+                size="event_count",
+                color="threat_level",
+                color_discrete_map={
+                    "CRITICAL": "#ef4444",
+                    "HIGH": "#f97316",
+                    "WARNING": "#eab308",
+                    "INFO": "#06b6d4",
+                    "INTERNAL": "#3b82f6",
+                },
+                hover_data={
+                    "city": True,
+                    "country": True,
+                    "threat_level": True,
+                    "event_count": True,
+                    "associated_users": True,
+                    "sample_action": True,
+                    "lat": False,
+                    "lon": False,
+                },
+                projection=projection_choice,
+                size_max=32,
+            )
 
-    # ---------------------------------------------------------
-    # Interactive Table with In-line Tagging (st.data_editor)
-    # ---------------------------------------------------------
-    st.subheader("📋 Interactive Log Table & Incident Tagging")
-    st.caption(
-        "💡 **Edit directly:** Change the **'Tag'** dropdown or type into **'Analyst Notes'**. "
-        "Your annotations are immediately persisted in memory and exportable."
-    )
+            fig_map.update_geos(
+                showcountries=True,
+                countrycolor="#334155",
+                showcoastlines=True,
+                coastlinecolor="#475569",
+                showland=True,
+                landcolor="#1e293b",
+                showocean=True,
+                oceancolor="#0b1329",
+                bgcolor="#0b1329",
+            )
 
-    # Filter DataFrame
-    table_df = df.copy()
+            fig_map.update_layout(
+                paper_bgcolor="#0b1329",
+                plot_bgcolor="#0b1329",
+                font=dict(color="#f8fafc"),
+                margin=dict(l=0, r=0, t=20, b=10),
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=-0.12,
+                    xanchor="center",
+                    x=0.5,
+                    title="Threat Level",
+                    font=dict(color="#f8fafc"),
+                ),
+                height=520,
+            )
 
-    if chosen_severities:
-        table_df = table_df[table_df["severity"].isin(chosen_severities)]
+            st.plotly_chart(fig_map, use_container_width=True)
 
-    if sel_ip != "All IPs":
-        table_df = table_df[table_df["ip_address"] == sel_ip]
+            # Geo-IP Telemetry Metrics
+            ext_ips = geo_df[~geo_df["is_internal"]]
+            int_ips = geo_df[geo_df["is_internal"]]
+            top_country = ext_ips["country"].value_counts().index[0] if not ext_ips.empty else "None"
 
-    if sel_user != "All Users":
-        table_df = table_df[table_df["username"] == sel_user]
+            gm1, gm2, gm3, gm4 = st.columns(4)
+            gm1.metric("External Threat IPs", len(ext_ips))
+            gm2.metric("Internal LAN Endpoints", len(int_ips))
+            gm3.metric("Top Threat Country", top_country)
+            gm4.metric("Mapped Locations", geo_df["city"].nunique())
 
-    # Tag and indicator columns
-    table_df["is_linked"] = table_df.index.isin(correlated_indices)
-    table_df["Status"] = table_df.apply(
-        lambda r: "🎯 LINKED" if r["is_linked"] else ("⚠️ " + r["severity"] if r["severity"] in ["CRITICAL", "HIGH"] else "ℹ️ " + r["severity"]),
-        axis=1,
-    )
+            st.markdown("##### 📍 IP Geographic Attribution Table")
+            display_geo = geo_df[["ip", "city", "country", "location_type", "threat_level", "event_count", "associated_users"]]
 
-    column_configurations = {
-        "Status": st.column_config.TextColumn("Status", width="small", disabled=True),
-        "event_id": st.column_config.TextColumn("ID", width="small", disabled=True),
-        "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss", disabled=True),
-        "source_file": st.column_config.TextColumn("Source File", width="small", disabled=True),
-        "ip_address": st.column_config.TextColumn("IP Address", width="small", disabled=True),
-        "username": st.column_config.TextColumn("User", width="small", disabled=True),
-        "severity": st.column_config.TextColumn("Severity", width="small", disabled=True),
-        "action": st.column_config.TextColumn("Event Action", width="medium", disabled=True),
-        "details": st.column_config.TextColumn("Details", width="large", disabled=True),
-        "tag": st.column_config.SelectboxColumn(
-            "Tag",
-            help="Assign investigation status to this event",
-            options=["Untagged", "Investigating", "Suspicious", "Malicious", "False Positive", "Resolved"],
-            required=True,
-            width="medium",
-        ),
-        "notes": st.column_config.TextColumn(
-            "Analyst Notes",
-            help="Type incident response notes here",
-            width="large",
-        ),
-    }
+            geo_cols = st.columns([4, 1])
+            geo_cols[0].dataframe(display_geo, use_container_width=True, hide_index=True)
 
-    cols_to_render = [
-        "Status",
-        "event_id",
-        "timestamp",
-        "source_file",
-        "ip_address",
-        "username",
-        "severity",
-        "action",
-        "details",
-        "tag",
-        "notes",
-    ]
+            with geo_cols[1]:
+                st.markdown("**⚡ 1-Click Pivot**")
+                for _, grow in geo_df.iterrows():
+                    btn_lbl = f"{grow['ip']}"
+                    if st.button(f"🔍 {btn_lbl}", key=f"btn_geo_{grow['ip']}", use_container_width=True):
+                        st.session_state.selected_ip = grow["ip"]
+                        st.session_state.selected_user = "All Users"
+                        st.session_state.focal_timestamp = df[df["ip_address"] == grow["ip"]]["timestamp"].iloc[0]
+                        st.rerun()
 
-    edited_results = st.data_editor(
-        table_df[cols_to_render],
-        column_config=column_configurations,
-        use_container_width=True,
-        num_rows="fixed",
-        key="siem_data_editor",
-    )
+    # =========================================================
+    # TAB 3: Entity Relationship Graph (Plotly + NetworkX)
+    # =========================================================
+    with tab_graph:
+        st.subheader("🕸️ Visual Entity Relationship Graph")
+        st.caption("Multi-dimensional correlation graph linking IP Addresses ⟷ User Accounts ⟷ Target Host Systems.")
 
-    # Sync modifications back to master session state DataFrame
-    if edited_results is not None:
-        for _, e_row in edited_results.iterrows():
-            eid = e_row["event_id"]
-            m_indices = df[df["event_id"] == eid].index
-            if len(m_indices) > 0:
-                midx = m_indices[0]
-                st.session_state.events_df.at[midx, "tag"] = e_row["tag"]
-                st.session_state.events_df.at[midx, "notes"] = e_row["notes"]
+        # Entity focus filter
+        all_graph_entities = ["All Entities"]
+        all_graph_entities.extend(sorted([ip for ip in df["ip_address"].unique() if ip != "-"]))
+        all_graph_entities.extend(sorted([u for u in df["username"].unique() if u != "-"]))
+        all_graph_entities.extend(sorted([h for h in df["host"].unique() if h != "-"]))
 
-    # ---------------------------------------------------------
-    # Row Quick Selector for Correlation
-    # ---------------------------------------------------------
-    st.markdown("##### 🎯 Quick Pivot from Table Row")
-    row_pick_col1, row_pick_col2 = st.columns([3, 1])
+        graph_col1, graph_col2 = st.columns([3, 1])
+        chosen_focus = graph_col1.selectbox("Ego Network Focus (Isolate 1-Hop Connected Subgraph)", all_graph_entities, index=0)
 
-    event_options = [
-        f"{r['event_id']} | {r['timestamp'].strftime('%H:%M:%S')} | {r['action']} | IP: {r['ip_address']} | User: {r['username']}"
-        for _, r in table_df.iterrows()
-    ]
+        fig_graph, g_stats = build_entity_graph(df, focus_entity=chosen_focus)
+        st.plotly_chart(fig_graph, use_container_width=True)
 
-    if event_options:
-        selected_option = row_pick_col1.selectbox(
-            "Select an event from the filtered table to pivot on its entity & timestamp:",
-            event_options,
-            label_visibility="collapsed",
+        # Graph Metrics
+        g1, g2, g3, g4, g5 = st.columns(5)
+        g1.metric("Total Nodes", g_stats["total_nodes"])
+        g2.metric("Total Link Edges", g_stats["total_edges"])
+        g3.metric("Host Systems", g_stats["hosts"])
+        g4.metric("IP Endpoints", g_stats["ips"])
+        g5.metric("User Identities", g_stats["users"])
+
+        st.markdown(
+            """
+            **Graph Legend & Interaction Guide:**
+            * 🟩 **Hosts (Green Squares)**: Target server assets (e.g. `srv-prod-01`, `web-prod-01`).
+            * 🔴 **Attacker IPs (Red Circles)**: External public IP sources performing recon, brute force, or attacks.
+            * 🔵 **Internal IPs (Blue Circles)**: Internal corporate endpoints or LAN backup agents.
+            * 🟧 **Targeted/Compromised Users (Orange Triangles)**: Users with High/Critical security activity.
+            * 🟪 **Standard Users (Purple Triangles)**: Normal system user accounts.
+            * **Lines (Edges)**: Interactions between entities. Hover over any node to inspect direct connections and event counts!
+            """
         )
-        if row_pick_col2.button("🎯 Focus Event", use_container_width=True):
-            chosen_eid = selected_option.split(" | ")[0]
-            matched_row = df[df["event_id"] == chosen_eid].iloc[0]
-            if matched_row["ip_address"] != "-":
-                st.session_state.selected_ip = matched_row["ip_address"]
-            if matched_row["username"] != "-":
-                st.session_state.selected_user = matched_row["username"]
-            st.session_state.focal_timestamp = matched_row["timestamp"]
+
+    # =========================================================
+    # TAB 4: Interactive Triage Table & Export
+    # =========================================================
+    with tab_table:
+        st.subheader("📋 Interactive Log Table & Incident Tagging")
+        st.caption(
+            "💡 **Analyst Triage:** Directly edit the **'Tag'** dropdown or type into **'Analyst Notes'**. "
+            "Modifications are saved immediately in memory and can be exported below."
+        )
+
+        # Table Filter Controls
+        tf_col1, tf_col2, tf_col3, tf_col4 = st.columns([2, 2, 2, 1])
+
+        avail_ips = ["All IPs"] + sorted([ip for ip in df["ip_address"].unique() if ip != "-"])
+        c_ip_idx = avail_ips.index(st.session_state.selected_ip) if st.session_state.selected_ip in avail_ips else 0
+        filter_ip = tf_col1.selectbox("Filter by IP", avail_ips, index=c_ip_idx, key="table_sel_ip")
+
+        avail_users = ["All Users"] + sorted([u for u in df["username"].unique() if u != "-"])
+        c_user_idx = avail_users.index(st.session_state.selected_user) if st.session_state.selected_user in avail_users else 0
+        filter_user = tf_col2.selectbox("Filter by User", avail_users, index=c_user_idx, key="table_sel_user")
+
+        chosen_sevs = tf_col3.multiselect(
+            "Filter Severity",
+            ["INFO", "WARNING", "HIGH", "CRITICAL"],
+            default=["INFO", "WARNING", "HIGH", "CRITICAL"],
+            key="table_sel_sev",
+        )
+
+        if tf_col4.button("Reset Filters", key="btn_reset_table_filters", use_container_width=True):
+            st.session_state.selected_ip = "All IPs"
+            st.session_state.selected_user = "All Users"
+            st.session_state.focal_timestamp = None
             st.rerun()
 
-    # ---------------------------------------------------------
-    # Incident Report Export
-    # ---------------------------------------------------------
-    st.divider()
-    st.subheader("📥 Export Triage Report")
+        st.session_state.selected_ip = filter_ip
+        st.session_state.selected_user = filter_user
 
-    annotated_count = len(df[df["tag"] != "Untagged"])
-    exp_col1, exp_col2 = st.columns([3, 1])
+        # Filter the DataFrame
+        table_df = df.copy()
+        if chosen_sevs:
+            table_df = table_df[table_df["severity"].isin(chosen_sevs)]
+        if filter_ip != "All IPs":
+            table_df = table_df[table_df["ip_address"] == filter_ip]
+        if filter_user != "All Users":
+            table_df = table_df[table_df["username"] == filter_user]
 
-    exp_col1.write(
-        f"Tagged / Reviewed Events: **{annotated_count}** of **{len(df)}** total events. "
-        "Export the annotated telemetry to CSV for your SOC incident log or executive summary."
-    )
+        # Calculate linked mask
+        is_piv = (filter_ip != "All IPs") or (filter_user != "All Users")
+        correlated_idx = set()
+        if is_piv:
+            m_entity = pd.Series([False] * len(df), index=df.index)
+            if filter_ip != "All IPs":
+                m_entity = m_entity | (df["ip_address"] == filter_ip)
+            if filter_user != "All Users":
+                m_entity = m_entity | (df["username"] == filter_user)
+            t_events = df[m_entity]
+            if not t_events.empty:
+                p_time = pd.to_datetime(st.session_state.focal_timestamp) if st.session_state.focal_timestamp else t_events["timestamp"].iloc[0]
+                w_delta = timedelta(minutes=st.session_state.time_window_mins)
+                l_mask = m_entity & (df["timestamp"] >= p_time - w_delta) & (df["timestamp"] <= p_time + w_delta)
+                correlated_idx = set(df[l_mask].index)
 
-    csv_data = df.to_csv(index=False).encode("utf-8")
-    now_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_col2.download_button(
-        label="Download Report (CSV)",
-        data=csv_data,
-        file_name=f"siem_incident_triage_{now_stamp}.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+        table_df["is_linked"] = table_df.index.isin(correlated_idx)
+        table_df["Status"] = table_df.apply(
+            lambda r: "🎯 LINKED" if r["is_linked"] else ("⚠️ " + r["severity"] if r["severity"] in ["CRITICAL", "HIGH"] else "ℹ️ " + r["severity"]),
+            axis=1,
+        )
+
+        column_configurations = {
+            "Status": st.column_config.TextColumn("Status", width="small", disabled=True),
+            "event_id": st.column_config.TextColumn("ID", width="small", disabled=True),
+            "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss", disabled=True),
+            "host": st.column_config.TextColumn("Target Host", width="small", disabled=True),
+            "source_file": st.column_config.TextColumn("Source File", width="small", disabled=True),
+            "ip_address": st.column_config.TextColumn("IP Address", width="small", disabled=True),
+            "username": st.column_config.TextColumn("User", width="small", disabled=True),
+            "severity": st.column_config.TextColumn("Severity", width="small", disabled=True),
+            "action": st.column_config.TextColumn("Event Action", width="medium", disabled=True),
+            "details": st.column_config.TextColumn("Details", width="large", disabled=True),
+            "tag": st.column_config.SelectboxColumn(
+                "Tag",
+                help="Assign investigation status to this event",
+                options=["Untagged", "Investigating", "Suspicious", "Malicious", "False Positive", "Resolved"],
+                required=True,
+                width="medium",
+            ),
+            "notes": st.column_config.TextColumn(
+                "Analyst Notes",
+                help="Type incident response notes here",
+                width="large",
+            ),
+        }
+
+        cols_to_render = [
+            "Status",
+            "event_id",
+            "timestamp",
+            "host",
+            "source_file",
+            "ip_address",
+            "username",
+            "severity",
+            "action",
+            "details",
+            "tag",
+            "notes",
+        ]
+
+        edited_results = st.data_editor(
+            table_df[cols_to_render],
+            column_config=column_configurations,
+            use_container_width=True,
+            num_rows="fixed",
+            key="siem_data_editor_v2",
+        )
+
+        # Sync changes back to session state DataFrame
+        if edited_results is not None:
+            for _, e_row in edited_results.iterrows():
+                eid = e_row["event_id"]
+                m_indices = df[df["event_id"] == eid].index
+                if len(m_indices) > 0:
+                    midx = m_indices[0]
+                    st.session_state.events_df.at[midx, "tag"] = e_row["tag"]
+                    st.session_state.events_df.at[midx, "notes"] = e_row["notes"]
+
+        # Export Report Section
+        st.divider()
+        st.subheader("📥 Export Triage Report")
+
+        annotated_count = len(df[df["tag"] != "Untagged"])
+        exp_col1, exp_col2 = st.columns([3, 1])
+
+        exp_col1.write(
+            f"Tagged / Reviewed Events: **{annotated_count}** of **{len(df)}** total events. "
+            "Export the annotated findings to CSV for your incident post-mortem or SIEM ticketing."
+        )
+
+        csv_data = df.to_csv(index=False).encode("utf-8")
+        now_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        exp_col2.download_button(
+            label="Download Report (CSV)",
+            data=csv_data,
+            file_name=f"siem_incident_triage_{now_stamp}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 
 if __name__ == "__main__":
